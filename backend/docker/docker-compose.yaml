@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    container_name: postgres_db
+    environment:
+      POSTGRES_USER: postgres
+
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: fastapi_backend
+    depends_on:
+      - db
+    env_file:
+      - ../env/backend.env
+      - ../env/db.env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:Abhi%402790@db:5432/postgres
+    ports:
+      - "8080:8080"
+    command: uvicorn app.app:app --host 0.0.0.0 --port 8080
+
+volumes:
+  pgdata:
