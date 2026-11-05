@@ -1,47 +1,286 @@
-# backend/app/routers/ingestion.py
+import asyncio
+import ipaddress
 import os
 import shutil
+import socket
 from pathlib import Path
-from fastapi import APIRouter, Request, Depends, HTTPException, File, UploadFile
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from langchain_community.document_loaders import PyMuPDFLoader, UnstructuredPowerPointLoader, UnstructuredWordDocumentLoader
+from urllib.parse import urlparse
 
-from app.database import get_db
-from app.models.quiz_resource import QuizResource
-from app.models.chunk import Chunk
-from app.ai.embedding_provider import generate_embeddings
+import httpx
+from bs4 import BeautifulSoup
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from langchain_community.document_loaders import (
+    PyMuPDFLoader,
+    UnstructuredPowerPointLoader,
+    UnstructuredWordDocumentLoader,
+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
+from app.database import get_db
+from app.dependencies import get_current_uid
+from app.models.chunk import Chunk
+from app.models.quiz_resource import QuizResource
+from app.ai.embedding_provider import generate_embeddings
+from app.models.quizes import Quiz
+
+
+UPLOAD_DIR = (
+    Path(__file__).resolve().parent.parent.parent / "uploads"
+)
+
 router = APIRouter(tags=["Ingestion"])
 
-from app.dependencies import get_current_uid
+MAX_FILE_SIZE = 10 * 1024 * 1024
+MAX_URL_SIZE = 5 * 1024 * 1024
+MAX_TEXT_CHARS = 100_000
+
 
 def extract_text(file_path: str) -> str:
-    suffix = os.path.splitext(file_path)[1].lower()
+    suffix = Path(file_path).suffix.lower()
+
     if suffix == ".pdf":
         loader = PyMuPDFLoader(file_path)
-        docs = loader.load()
-        return "\n\n".join([doc.page_content for doc in docs])
-    elif suffix in [".ppt", ".pptx"]:
+        documents = loader.load()
+        return "\n\n".join(doc.page_content for doc in documents)
+
+    if suffix in [".ppt", ".pptx"]:
         loader = UnstructuredPowerPointLoader(file_path)
-        docs = loader.load()
-        return "\n\n".join([doc.page_content for doc in docs])
-    elif suffix in [".doc", ".docx"]:
+        documents = loader.load()
+        return "\n\n".join(doc.page_content for doc in documents)
+
+    if suffix in [".doc", ".docx"]:
         loader = UnstructuredWordDocumentLoader(file_path)
-        docs = loader.load()
-        return "\n\n".join([doc.page_content for doc in docs])
-    elif suffix == ".txt":
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
-    else:
-        raise ValueError(f"Unsupported file format: {suffix}")
+        documents = loader.load()
+        return "\n\n".join(doc.page_content for doc in documents)
+
+    if suffix == ".txt":
+        with open(
+            file_path,
+            "r",
+            encoding="utf-8",
+            errors="ignore",
+        ) as file:
+            return file.read()
+
+    raise ValueError(f"Unsupported file format: {suffix}")
+
 
 def cleanup_quiz_directory(quiz_id: int) -> None:
-    quiz_upload_dir = UPLOAD_DIR / str(quiz_id)
-    if quiz_upload_dir.exists():
-        shutil.rmtree(quiz_upload_dir, ignore_errors=True)
+    directory = UPLOAD_DIR / str(quiz_id)
+
+    if directory.exists():
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+async def ensure_quiz_owner(
+    quiz_id: int,
+    uid: str,
+    db: AsyncSession,
+) -> Quiz:
+    result = await db.execute(
+        select(Quiz).where(Quiz.id == quiz_id)
+    )
+
+    quiz = result.scalar_one_or_none()
+
+    if not quiz:
+        raise HTTPException(
+            status_code=404,
+            detail="Quiz not found.",
+        )
+
+    if quiz.creator_uid != uid:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to modify this quiz.",
+        )
+
+    if quiz.status != "draft":
+        raise HTTPException(
+            status_code=400,
+            detail="Resources can only be changed for draft quizzes.",
+        )
+
+    return quiz
+
+
+def split_text(text_content: str) -> list[str]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len,
+        is_separator_regex=False,
+    )
+
+    return splitter.split_text(text_content[:MAX_TEXT_CHARS])
+
+
+async def save_text_chunks(
+    quiz_id: int,
+    resource_id: int,
+    text_content: str,
+    db: AsyncSession,
+) -> int:
+    if not text_content.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="No readable text was extracted from this resource.",
+        )
+
+    chunks = split_text(text_content)
+
+    if not chunks:
+        raise HTTPException(
+            status_code=422,
+            detail="No usable text chunks were extracted.",
+        )
+
+    embeddings = await generate_embeddings(chunks)
+
+    if len(embeddings) != len(chunks):
+        raise RuntimeError(
+            "Embedding provider returned an unexpected number of vectors."
+        )
+
+    for chunk_text, embedding in zip(chunks, embeddings):
+        db.add(
+            Chunk(
+                quiz_id=quiz_id,
+                resource_id=resource_id,
+                content=chunk_text,
+                embedding=embedding,
+            )
+        )
+
+    await db.commit()
+    return len(chunks)
+
+
+async def extract_public_url(url: str) -> str:
+    parsed = urlparse(url)
+
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Only HTTP and HTTPS URLs are supported.",
+        )
+
+    if not parsed.hostname:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid website URL.",
+        )
+
+    if parsed.username or parsed.password:
+        raise HTTPException(
+            status_code=400,
+            detail="URLs containing credentials are not supported.",
+        )
+
+    try:
+        addresses = await asyncio.to_thread(
+            socket.getaddrinfo,
+            parsed.hostname,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not resolve the website hostname.",
+        )
+
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Private or local network URLs are not allowed.",
+            )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=20,
+            follow_redirects=False,
+            headers={
+                "User-Agent": "ZiuQAI/1.0",
+                "Accept": "text/html,text/plain",
+            },
+        ) as client:
+            response = await client.get(url)
+
+            if response.is_redirect:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Website redirects are not supported. Add the final URL instead.",
+                )
+
+            response.raise_for_status()
+
+            content_type = response.headers.get(
+                "content-type",
+                "",
+            ).lower()
+
+            if not (
+                "text/html" in content_type
+                or "text/plain" in content_type
+            ):
+                raise HTTPException(
+                    status_code=415,
+                    detail="The URL must return an HTML or plain-text page.",
+                )
+
+            if len(response.content) > MAX_URL_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail="The webpage is too large to process.",
+                )
+
+            if "text/plain" in content_type:
+                text_content = response.text
+            else:
+                soup = BeautifulSoup(
+                    response.text,
+                    "html.parser",
+                )
+
+                for element in soup(
+                    ["script", "style", "noscript", "svg"]
+                ):
+                    element.decompose()
+
+                text_content = soup.get_text(
+                    separator="\n",
+                    strip=True,
+                )
+
+            if not text_content.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail="No readable text was found on this webpage.",
+                )
+
+            return text_content[:MAX_TEXT_CHARS]
+
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to retrieve webpage: {exc}",
+        )
+
 
 @router.post("/upload")
 async def upload_file(
@@ -51,82 +290,171 @@ async def upload_file(
     db: AsyncSession = Depends(get_db),
 ):
     if not quiz_id:
-        raise HTTPException(status_code=400, detail="quiz_id parameter is required")
+        raise HTTPException(
+            status_code=400,
+            detail="quiz_id parameter is required.",
+        )
 
-    from app.models.quizes import Quiz
-    q_result = await db.execute(select(Quiz).where(Quiz.id == quiz_id))
-    quiz = q_result.scalar_one_or_none()
-    if not quiz:
-        raise HTTPException(status_code=404, detail="Quiz not found")
-    if quiz.creator_uid != uid:
-        raise HTTPException(status_code=403, detail="Not authorized to modify this quiz")
-        
+    await ensure_quiz_owner(quiz_id, uid, db)
+
     if not file.filename:
-        raise HTTPException(status_code=400, detail="Invalid file")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file.",
+        )
+
+    filename = Path(file.filename).name
+    suffix = Path(filename).suffix.lower()
+
+    supported = {
+        ".pdf",
+        ".txt",
+        ".doc",
+        ".docx",
+        ".ppt",
+        ".pptx",
+    }
+
+    if suffix not in supported:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type: {suffix}",
+        )
+
+    content = await file.read()
+
+    if not content:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is empty.",
+        )
+
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="Files must be 10 MB or smaller.",
+        )
 
     quiz_upload_dir = UPLOAD_DIR / str(quiz_id)
     quiz_upload_dir.mkdir(parents=True, exist_ok=True)
-    file_path = quiz_upload_dir / file.filename
+
+    file_path = quiz_upload_dir / filename
 
     try:
-        content = await file.read()
-        with open(file_path, "wb") as f:
-            f.write(content)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+        with open(file_path, "wb") as output_file:
+            output_file.write(content)
+
+        text_content = await asyncio.to_thread(
+            extract_text,
+            str(file_path),
+        )
+
+        if not text_content.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="No readable text was extracted from the file.",
+            )
+
+        resource = QuizResource(
+            quiz_id=quiz_id,
+            filename=filename,
+            file_path=str(file_path),
+            file_size_mb=round(
+                len(content) / (1024 * 1024),
+                2,
+            ),
+        )
+
+        db.add(resource)
+        await db.flush()
+
+        chunk_count = await save_text_chunks(
+            quiz_id,
+            resource.id,
+            text_content,
+            db,
+        )
+
+        await db.refresh(resource)
+
+        return {
+            "status": "success",
+            "resource_id": resource.id,
+            "filename": resource.filename,
+            "file_size_mb": resource.file_size_mb,
+            "quiz_id": quiz_id,
+            "chunks_created": chunk_count,
+        }
+
+    except HTTPException:
+        await db.rollback()
+
+        if file_path.exists():
+            file_path.unlink()
+
+        raise
+
+    except Exception as exc:
+        await db.rollback()
+
+        if file_path.exists():
+            file_path.unlink()
+
+        print(
+            f"[INGESTION] Failed to process {filename}: {repr(exc)}",
+            flush=True,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="File processing failed. Check the backend terminal.",
+        )
+
     finally:
         await file.close()
 
-    file_size_mb = round(len(content) / (1024 * 1024), 2)
+
+@router.post("/url")
+async def ingest_website_url(
+    quiz_id: int,
+    url: str,
+    uid: str = Depends(get_current_uid),
+    db: AsyncSession = Depends(get_db),
+):
+    await ensure_quiz_owner(quiz_id, uid, db)
+
+    text_content = await extract_public_url(url)
+
     resource = QuizResource(
         quiz_id=quiz_id,
-        filename=file.filename,
-        file_path=str(file_path),
-        file_size_mb=file_size_mb,
+        filename=url,
+        file_path=url,
+        file_size_mb=0,
     )
-    db.add(resource)
-    await db.commit()
-    await db.refresh(resource)
 
-    # RAG Integration: Process the file text, chunk it, and save embeddings
     try:
-        text_content = extract_text(str(file_path))
-        if text_content.strip():
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
-                length_function=len,
-                is_separator_regex=False,
-            )
-            chunks = text_splitter.split_text(text_content)
-            
-            if chunks:
-                embeddings = await generate_embeddings(chunks)
-                
-                db_chunks = []
-                for chunk_text, embedding in zip(chunks, embeddings):
-                    db_chunk = Chunk(
-                        quiz_id=quiz_id,
-                        resource_id=resource.id,
-                        content=chunk_text,
-                        embedding=embedding
-                    )
-                    db.add(db_chunk)
-                    db_chunks.append(db_chunk)
-                    
-                await db.commit()
-    except Exception as e:
-        print(f"Failed to process RAG chunks: {e}")
-        # Even if RAG processing fails, we return success for the file upload, 
-        # or we could rollback. Let's just print a warning for now.
+        db.add(resource)
+        await db.flush()
 
-    return {
-        "status": "success",
-        "resource_id": resource.id,
-        "filename": resource.filename,
-        "file_size_mb": resource.file_size_mb,
-        "quiz_id": quiz_id,
-    }
+        chunk_count = await save_text_chunks(
+            quiz_id,
+            resource.id,
+            text_content,
+            db,
+        )
+
+        return {
+            "status": "success",
+            "resource_id": resource.id,
+            "filename": url,
+            "quiz_id": quiz_id,
+            "chunks_created": chunk_count,
+        }
+
+    except Exception:
+        await db.rollback()
+        raise
+
 
 @router.get("/resources/{quiz_id}")
 async def list_resources(
@@ -134,26 +462,30 @@ async def list_resources(
     uid: str = Depends(get_current_uid),
     db: AsyncSession = Depends(get_db),
 ):
-    from app.models.quizes import Quiz
-    q_result = await db.execute(select(Quiz).where(Quiz.id == quiz_id))
-    quiz = q_result.scalar_one_or_none()
-    if not quiz:
-        raise HTTPException(status_code=404, detail="Quiz not found")
-    if quiz.creator_uid != uid:
-        raise HTTPException(status_code=403, detail="Not authorized to view resources for this quiz")
+    await ensure_quiz_owner(quiz_id, uid, db)
 
-    result = await db.execute(select(QuizResource).where(QuizResource.quiz_id == quiz_id))
+    result = await db.execute(
+        select(QuizResource).where(
+            QuizResource.quiz_id == quiz_id
+        )
+    )
+
     resources = result.scalars().all()
-    
+
     return [
         {
-            "id": r.id,
-            "filename": r.filename,
-            "file_size_mb": r.file_size_mb,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "id": resource.id,
+            "filename": resource.filename,
+            "file_size_mb": resource.file_size_mb,
+            "created_at": (
+                resource.created_at.isoformat()
+                if resource.created_at
+                else None
+            ),
         }
-        for r in resources
+        for resource in resources
     ]
+
 
 @router.delete("/resources/{quiz_id}/{resource_id}")
 async def delete_resource(
@@ -162,29 +494,31 @@ async def delete_resource(
     uid: str = Depends(get_current_uid),
     db: AsyncSession = Depends(get_db),
 ):
-    from app.models.quizes import Quiz
-    q_result = await db.execute(select(Quiz).where(Quiz.id == quiz_id))
-    quiz = q_result.scalar_one_or_none()
-    if not quiz:
-        raise HTTPException(status_code=404, detail="Quiz not found")
-    if quiz.creator_uid != uid:
-        raise HTTPException(status_code=403, detail="Not authorized to delete resources for this quiz")
-    
-    result = await db.execute(
-        select(QuizResource).where(QuizResource.id == resource_id, QuizResource.quiz_id == quiz_id)
-    )
-    resource = result.scalar_one_or_none()
-    
-    if not resource:
-        raise HTTPException(status_code=404, detail="Resource not found")
+    await ensure_quiz_owner(quiz_id, uid, db)
 
-    try:
-        file_path = Path(resource.file_path)
-        if file_path.exists():
-            file_path.unlink()
-    except Exception:
-        pass
+    result = await db.execute(
+        select(QuizResource).where(
+            QuizResource.id == resource_id,
+            QuizResource.quiz_id == quiz_id,
+        )
+    )
+
+    resource = result.scalar_one_or_none()
+
+    if not resource:
+        raise HTTPException(
+            status_code=404,
+            detail="Resource not found.",
+        )
+
+    file_path = Path(resource.file_path)
+
+    if file_path.exists():
+        file_path.unlink()
 
     await db.delete(resource)
     await db.commit()
-    return {"message": "Resource deleted successfully"}
+
+    return {
+        "message": "Resource deleted successfully."
+    }
