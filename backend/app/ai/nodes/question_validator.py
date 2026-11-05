@@ -1,56 +1,100 @@
-# backend/app/ai_engine/nodes/question_validator.py
 from app.ai.state import QuizGraphState
+
 
 async def validate_questions(state: QuizGraphState) -> dict:
     questions = state.get("questions", [])
     expected_count = state.get("question_count", 5)
-    allowed_types = state.get("question_types", ["mcq", "scq", "tof", "fib"])
 
-    errors = []
-    is_valid = True
+    allowed_types = {
+        str(value).lower()
+        for value in state.get(
+            "question_types",
+            ["scq", "mcq"],
+        )
+    }
+
+    errors: list[str] = []
 
     if not isinstance(questions, list):
-        errors.append("Questions is not a list")
-        return {"is_valid": False, "errors": errors}
+        return {
+            "is_valid": False,
+            "errors": ["Questions is not a list."],
+        }
 
     if len(questions) != expected_count:
-        errors.append(f"Expected {expected_count} questions, but got {len(questions)}")
-        is_valid = False
+        errors.append(
+            f"Expected {expected_count} questions, "
+            f"but got {len(questions)}."
+        )
 
-    for idx, q in enumerate(questions):
-        if not isinstance(q, dict):
-            errors.append(f"Question at index {idx} is not an object")
-            is_valid = False
+    for idx, question in enumerate(questions):
+        if not isinstance(question, dict):
+            errors.append(
+                f"Question at index {idx} is not an object."
+            )
             continue
 
-        q_text = q.get("question")
-        q_type = q.get("question_type")
-        correct_ans = q.get("correct_answer")
-        options = q.get("options")
+        question_text = question.get("question")
+        question_type = str(
+            question.get("question_type", "")
+        ).lower()
+        correct_answer = question.get("correct_answer")
+        options = question.get("options")
 
-        if not q_text or not isinstance(q_text, str):
-            errors.append(f"Question at index {idx} has missing or invalid 'question' field")
-            is_valid = False
+        if not isinstance(question_text, str) or not question_text.strip():
+            errors.append(
+                f"Question at index {idx} has invalid question text."
+            )
 
-        if not q_type or q_type not in allowed_types:
-            errors.append(f"Question at index {idx} has invalid or disallowed type: {q_type}")
-            is_valid = False
+        if question_type not in allowed_types:
+            errors.append(
+                f"Question at index {idx} has invalid type: {question_type}."
+            )
 
-        if correct_ans is None or correct_ans == "":
-            errors.append(f"Question at index {idx} has missing 'correct_answer'")
-            is_valid = False
+        if correct_answer is None or correct_answer == "":
+            errors.append(
+                f"Question at index {idx} has no correct answer."
+            )
 
-        if q_type in ["scq", "mcq"]:
-            if not isinstance(options, list) or len(options) < 2:
-                errors.append(f"Question at index {idx} ({q_type}) must have a list of options with at least 2 elements")
-                is_valid = False
-        elif q_type == "tof":
-            if not isinstance(options, list) or set(options) != {"True", "False"}:
-                errors.append(f"Question at index {idx} (tof) must have options exactly equal to ['True', 'False']")
-                is_valid = False
-        elif q_type == "fib":
+        if question_type in ["scq", "mcq"]:
+            if (
+                not isinstance(options, list)
+                or len(options) < 2
+                or not all(isinstance(option, str) for option in options)
+            ):
+                errors.append(
+                    f"Question at index {idx} requires at least "
+                    "two string options."
+                )
+
+            if isinstance(options, list) and isinstance(correct_answer, str):
+                valid_answers = set(options)
+                submitted_answers = {
+                    answer.strip()
+                    for answer in correct_answer.split(",")
+                    if answer.strip()
+                }
+
+                if not submitted_answers.issubset(valid_answers):
+                    errors.append(
+                        f"Question at index {idx} has a correct answer "
+                        "that is not present in its options."
+                    )
+
+        elif question_type == "tof":
+            if options != ["True", "False"]:
+                errors.append(
+                    f"Question at index {idx} must have "
+                    "options ['True', 'False']."
+                )
+
+        elif question_type == "fib":
             if options is not None:
-                errors.append(f"Question at index {idx} (fib) must have options equal to null")
-                is_valid = False
+                errors.append(
+                    f"Question at index {idx} must have null options."
+                )
 
-    return {"is_valid": is_valid, "errors": errors}
+    return {
+        "is_valid": len(errors) == 0,
+        "errors": errors,
+    }
